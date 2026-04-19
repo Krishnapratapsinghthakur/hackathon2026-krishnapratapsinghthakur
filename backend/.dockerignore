@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.local
+.git
+.gitignore
+venv/
+.venv/
+sample_data/
+*.md
+!app/db/seed/knowledge-base.md
+.cursor/
+.claude/
+node_modules/

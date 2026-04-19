@@ -1,0 +1,29 @@
+# Root + monorepo
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.cursor/
+.claude/
+sample_data/
+.logs/
+
+# Backend (Python)
+backend/.env
+backend/.venv/
+backend/venv/
+backend/.logs/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# Frontend (Node)
+frontend/node_modules/
+frontend/.next/
+frontend/out/

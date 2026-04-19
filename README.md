@@ -1,112 +1,114 @@
 # ShopWave Autonomous Support Resolution Agent
 
-AI-powered customer support agent that ingests, classifies, and autonomously resolves support tickets using **LangGraph** orchestration with **LangChain** tools, persisted to **Supabase Postgres**.
+AI-powered customer support agent that ingests, classifies, and autonomously resolves support tickets using **LangGraph** orchestration, **Redis** caching, **Celery** background workers, and **Supabase Postgres** persistence.
 
-## Monorepo layout
+> **Full architecture deep-dive**: [ARCHITECTURE.md](./ARCHITECTURE.md)
 
-| Path | Role | Default port |
-|------|------|----------------|
-| **`backend/`** | FastAPI, LangGraph, Celery tasks, pytest, `Dockerfile`, `.env` | **8000** |
-| **`frontend/`** | Next.js UI (`NEXT_PUBLIC_API_URL` → API) | **3000** |
-| **`docker-compose.yml`** (repo root) | Shared **Redis**; optional **`--profile full`** builds API + Web | Redis **6379** |
+---
 
-The two apps are **separate packages** (Python vs Node), different ports, and independent deploy roots — no file or dependency collision.
+## What Makes This Production-Ready
 
-## Architecture
+This is not a tutorial project with a single `main.py`. Here is what separates it from typical LLM demos:
+
+| Concern | Tutorial Project | ShopWave |
+|---------|-----------------|----------|
+| **Processing** | Sync, blocks on every LLM call | Celery workers for async dispatch, sync fallback |
+| **Resilience** | Crashes on first error | 3-level retry (app + LLM 429 + Celery), dead-letter queue, graceful degradation |
+| **Caching** | None | Redis cache-aside with 6 TTL tiers (2 min - 30 min) |
+| **Database** | SQLite or none | Supabase Postgres with asyncpg pool (2-10), 8 tables, indexed |
+| **Security** | Open endpoints | API key auth, rate limiting, CORS, request ID tracing, Pydantic validation |
+| **LLM Management** | Single hardcoded model | 5 providers, smart cost-based routing, process-wide rate gate |
+| **Observability** | `print()` statements | Structured JSON logging, full audit trail, tool transparency, cost tracking |
+| **Validation** | Trust LLM output | Pydantic schema on every tool output, confidence calibration, policy violation detection |
+| **Deployment** | `python app.py` | Docker Compose, multi-stage builds, non-root containers, health checks |
+| **Cost Control** | Unknown spend | Token counting, per-model pricing, budget tracking, smart routing |
+| **Failure Modes** | Untested | Configurable tool failure injection, duplicate detection, DLQ with Postgres persistence |
+
+---
+
+## Architecture at a Glance
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        FastAPI Application                           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────────────┐   │
-│  │  /health  │  │ /tickets │  │  /audit  │  │    /settings      │   │
-│  └──────────┘  └────┬─────┘  └──────────┘  └───────────────────┘   │
-│                     │                                                │
-│        ┌────────────┴────────────┐                                   │
-│        │  Security Middleware     │                                   │
-│        │  • API Key Auth          │                                   │
-│        │  • Rate Limiting (60/m)  │                                   │
-│        │  • Request ID Tracking   │                                   │
-│        │  • CORS Policy           │                                   │
-│        └────────────┬────────────┘                                   │
-│                     │                                                │
-│   ┌─────────────────┴──────────────────┐                             │
-│   │        Ticket Processor            │                             │
-│   │  • Pydantic validation             │                             │
-│   │  • Duplicate detection             │                             │
-│   │  • Customer/order pre-fetch        │                             │
-│   │  • Smart model routing             │                             │
-│   │  • Retry + backoff + DLQ           │                             │
-│   └─────────────────┬──────────────────┘                             │
-│                     │                                                │
-│   ┌─────────────────┴──────────────────┐                             │
-│   │      LangGraph State Machine       │                             │
-│   │  classify → agent ↔ tools → parse  │                             │
-│   │  ReAct loop with conditional edges │                             │
-│   └─────────────────┬──────────────────┘                             │
-│                     │                                                │
-│   ┌─────────────────┴──────────────────┐                             │
-│   │    LLM Factory (Multi-Provider)    │                             │
-│   │  Groq (free) │ OpenAI │ Anthropic  │                             │
-│   └────────────────────────────────────┘                             │
-│                     │                                                │
-│   ┌─────────────────┴──────────────────┐                             │
-│   │        Supabase Postgres           │                             │
-│   │  8 tables • asyncpg pool           │                             │
-│   │  Domain + Operational data         │                             │
-│   └────────────────────────────────────┘                             │
-└──────────────────────────────────────────────────────────────────────┘
+  Next.js Frontend (:3000)
+         |
+    FastAPI Backend (:8000)
+    |-- Security: API Key + Rate Limit + CORS + Request ID
+    |-- Processor: Validation -> Routing -> Retry -> DLQ
+    |-- LangGraph: classify -> agent <-> tools -> parse_result
+    |-- LLM Factory: Groq | OpenAI | Anthropic | Google | Ollama
+    +-- Audit + Cost Tracking
+         |                    |
+    Redis (:6379)        PostgreSQL
+    |-- Cache (DB 0)     |-- 5 domain tables (seeded)
+    |-- Celery MQ (DB 1) +-- 3 operational tables (runtime)
+    +-- Results (DB 2)
+         |
+    Celery Worker
+    +-- Background ticket processing
 ```
 
-## Tech Stack
+> Full diagrams, data flows, and table schemas: [ARCHITECTURE.md](./ARCHITECTURE.md)
 
-| Layer | Technology |
-|---|---|
-| API Framework | FastAPI + Uvicorn |
-| LLM Orchestration | LangGraph + LangChain |
-| LLM Providers | Groq (free), OpenAI, Anthropic |
-| Database | Supabase Postgres (asyncpg) |
-| Validation | Pydantic v2 |
-| Auth | API Key (X-API-Key header) |
-| Rate Limiting | SlowAPI |
-| Testing | pytest + pytest-asyncio |
-| Deployment | Docker Compose (root), Railway/Render (set **Root Directory** per service) |
+---
+
+## Monorepo Layout
+
+| Path | Role | Default Port |
+|------|------|:------------:|
+| `backend/` | FastAPI + LangGraph + Celery + pytest | **8000** |
+| `frontend/` | Next.js 16 + React 19 + Tailwind 4 | **3000** |
+| `docker-compose.yml` | Shared Redis; optional `--profile full` for full stack | **6379** |
+
+The two apps are separate packages (Python vs Node), independent ports, independent deploy roots.
+
+---
 
 ## Quick Start
 
-```bash
-git clone <repo-url> && cd ksolves
+### 1. Backend (FastAPI)
 
-# ── Backend (FastAPI) ─────────────────────────────────────────
+```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: GROQ_API_KEY, DATABASE_URL, CORS_ORIGINS (include http://localhost:3000)
+# Edit .env: set GROQ_API_KEY (free), optionally DATABASE_URL and REDIS_URL
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-# ── Frontend (Next.js) — second terminal ─────────────────────
-cd ../frontend
-cp env.sample .env.local
-# .env.local: NEXT_PUBLIC_API_URL=http://localhost:8000
-npm install && npm run dev
-# Open http://localhost:3000
-
-# ── Tests (from backend/) ────────────────────────────────────
-cd ../backend && PYTHONPATH=. pytest tests/ -v
 ```
 
-### Local Redis + API + worker (optional)
-
-From repo root (starts Redis via Docker if available, then API from `backend/`):
+### 2. Frontend (Next.js) — second terminal
 
 ```bash
-bash backend/scripts/run-all.sh
+cd frontend
+cp env.sample .env.local   # NEXT_PUBLIC_API_URL=http://localhost:8000
+npm install && npm run dev
+# Open http://localhost:3000
 ```
+
+### 3. Redis + Celery Worker (optional)
+
+```bash
+# Start Redis
+docker compose up -d
+
+# Start Celery worker (from backend/)
+celery -A app.core.celery_app worker --loglevel=info --queues=tickets,batch
+```
+
+### 4. Tests
+
+```bash
+cd backend && PYTHONPATH=. pytest tests/ -v --tb=short
+```
+
+51 tests covering API routes, validation, smart routing, store, cost tracking, and security.
+
+---
 
 ## Environment Configuration
 
 ```bash
-# Development (Groq free tier — $0.00)
+# Development (Groq free tier - $0.00)
 ENVIRONMENT=development
 GROQ_API_KEY=gsk_your-key
 
@@ -115,23 +117,47 @@ ENVIRONMENT=production
 OPENAI_API_KEY=sk-your-key
 ```
 
-Just flip `ENVIRONMENT` — provider, models, and routing presets switch automatically.
+Just flip `ENVIRONMENT` — provider, models, and routing presets switch automatically. See `.env.example` for all options.
+
+---
 
 ## API Endpoints
 
 | Method | Endpoint | Description | Rate Limit |
-|---|---|---|---|
-| GET | `/health` | Status, DB mode, LLM config | — |
-| POST | `/tickets/process` | Process single ticket | 30/min |
-| POST | `/tickets/batch` | Process batch of tickets | 5/min |
-| GET | `/tickets/sample` | List 20 sample tickets | — |
-| GET | `/audit` | All audit entries | — |
-| GET | `/audit/{ticket_id}` | Single ticket audit trail | — |
-| GET | `/audit/dlq` | Dead-letter queue | — |
-| GET | `/settings` | Current LLM config | — |
-| GET | `/settings/models` | Supported models + pricing | — |
-| GET | `/settings/costs` | Token usage + cost breakdown | — |
-| GET | `/docs` | Swagger UI | — |
+|--------|----------|-------------|:----------:|
+| `GET` | `/health` | System status, DB mode, LLM config | -- |
+| `POST` | `/tickets/process` | Process single ticket (sync or `?async=true`) | 30/min |
+| `POST` | `/tickets/batch` | Process batch with bounded concurrency | 5/min |
+| `POST` | `/tickets/quick` | Minimal input: email + message | 30/min |
+| `GET` | `/tickets/status/{task_id}` | Poll Celery task progress | -- |
+| `GET` | `/tickets/result/{ticket_id}` | Cached result (Redis) | -- |
+| `GET` | `/tickets/sample` | List seeded sample tickets | -- |
+| `GET` | `/audit` | Full audit trail | -- |
+| `GET` | `/audit/{ticket_id}` | Per-ticket audit detail | -- |
+| `GET` | `/audit/dlq` | Dead-letter queue | -- |
+| `GET` | `/settings` | Current LLM configuration | -- |
+| `GET` | `/settings/models` | Supported models + pricing | -- |
+| `GET` | `/settings/costs` | Token usage + cost breakdown | -- |
+| `GET` | `/docs` | Swagger UI | -- |
+| `GET` | `/redoc` | ReDoc | -- |
+
+---
+
+## Smart Model Routing
+
+Zero-cost heuristic engine (no LLM call) that routes each ticket to the optimal model:
+
+| Signal | Route |
+|--------|-------|
+| VIP/Premium customer | Power model |
+| Threatening/legal language | Power model |
+| Fraud/social engineering patterns | Power model |
+| High-value order (>$200) | Power model |
+| Vague ticket (<10 words, no IDs) | Power model |
+| Multiple orders (>2) | Power model |
+| Standard ticket | Fast model |
+
+---
 
 ## Database Schema (8 Tables)
 
@@ -147,76 +173,152 @@ Just flip `ENVIRONMENT` — provider, models, and routing presets switch automat
 - `cost_tracking` — Token usage + estimated cost per ticket
 - `dead_letter_queue` — Failed tickets after retry exhaustion
 
+> Full schema with columns and indexes: [ARCHITECTURE.md](./ARCHITECTURE.md#postgresql--persistent-storage)
+
+---
+
+## Redis Caching Strategy
+
+Cache-aside pattern with domain-specific TTLs:
+
+| Data | TTL | Why |
+|------|:---:|-----|
+| Customer profiles | 5 min | Rarely changes, frequent reads |
+| Product catalog | 10 min | Static reference data |
+| Order details | 2 min | Can change (refund status) |
+| Knowledge base | 30 min | Almost never changes |
+| Ticket results | 10 min | Hot reads after resolution |
+| Audit entries | 1 min | Write-heavy, need freshness |
+
+If Redis is down, the system continues with Postgres-only reads. No crash, no data loss.
+
+---
+
+## Celery Background Workers
+
+```
+FastAPI (web) -> Celery task -> LangGraph agent -> Postgres + Redis
+```
+
+- **Broker**: Redis DB 1
+- **Backend**: Redis DB 2
+- **Crash safety**: `task_acks_late=true` — tasks acknowledged after completion
+- **Time limits**: 120s soft / 180s hard per ticket
+- **Queue routing**: `tickets` queue for single, `batch` queue for batch
+- **Fallback**: If Celery is unavailable, requests process synchronously
+
+---
+
 ## Security
 
-- **API Key Auth** — Set `API_KEY` in `.env` to require `X-API-Key` header (disabled when empty)
-- **Rate Limiting** — 30 req/min for single tickets, 5 req/min for batch
-- **CORS** — Configurable origins via `CORS_ORIGINS` (comma-separated)
-- **Request ID** — Every response includes `X-Request-ID` for tracing
-- **Input Validation** — Pydantic validators on all inputs (email format, non-empty body, etc.)
-- **No hardcoded secrets** — All sensitive config via environment variables
+| Feature | Implementation |
+|---------|---------------|
+| API Key Auth | `X-API-Key` header (optional — disabled when empty) |
+| Rate Limiting | SlowAPI: 30/min single, 5/min batch, 60/min global |
+| CORS | Configurable origins via `CORS_ORIGINS` |
+| Request Tracing | `X-Request-ID` on every response |
+| Input Validation | Pydantic v2 validators (email, body, ticket_id) |
+| No Hardcoded Secrets | All config via environment variables |
+| Non-Root Containers | Both Docker images run as unprivileged users |
+| Tool Output Validation | Pydantic schema per tool — LLM never sees invalid data |
 
-## Smart Model Routing
-
-Heuristic engine that decides fast (cheap) vs power (expensive) model per ticket:
-
-| Signal | Route |
-|---|---|
-| VIP/Premium customer | → Power model |
-| Threatening/legal language | → Power model |
-| Fraud/social engineering patterns | → Power model |
-| High-value order (>$200) | → Power model |
-| Vague ticket (<10 words, no IDs) | → Power model |
-| Multiple orders (>2) | → Power model |
-| Standard ticket | → Fast model |
-
-## Project Structure
-
-Python package lives under **`backend/`** (run commands from that directory).
-
-```
-backend/
-├── app/                        # FastAPI + LangGraph + services
-├── tests/
-├── requirements.txt
-├── Dockerfile
-├── Procfile
-└── .env.example
-
-frontend/
-├── app/                        # Next.js App Router
-├── components/
-├── lib/
-├── package.json
-├── Dockerfile
-└── env.sample
-```
+---
 
 ## Deployment
 
-**Ports:** API **8000**, UI **3000**, Redis **6379** — do not bind two services to the same host port.
+### Docker Compose
 
 ```bash
-# API image only (build context = backend/)
-docker build -t shopwave-api -f backend/Dockerfile ./backend
-docker run -p 8000:8000 --env-file backend/.env shopwave-api
+# Redis only (default — no port collision with local dev)
+docker compose up -d
 
-# UI image (build context = frontend/)
-docker build -t shopwave-web -f frontend/Dockerfile ./frontend
-
-# Redis + API + Web together (stop local dev servers first to free ports)
+# Full stack (Redis + API + Web)
 docker compose --profile full up --build -d
 ```
 
-**Railway / Render:** create **two services** from the same repo — set **Root Directory** to `backend` (start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`) and `frontend` (build/start per platform docs). Set `NEXT_PUBLIC_API_URL` on the frontend service to the **public URL** of the API.
+### Individual Containers
 
-### Frontend on Render + Backend on Railway (split hosts)
+```bash
+# API
+docker build -t shopwave-api -f backend/Dockerfile ./backend
+docker run -p 8000:8000 --env-file backend/.env shopwave-api
 
-1. **Railway** — New project → add **Redis** (template) → **New** → **GitHub Repo** → pick this repo → set **Root Directory** to `backend` → deploy (uses `backend/Dockerfile`; listens on `PORT`).
-2. **Railway** — In the **backend** service → **Variables**: `GROQ_API_KEY`, optional `DATABASE_URL`, `ENVIRONMENT`, and point `REDIS_URL` / `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` at your Redis (same host, paths `/0`, `/1`, `/2` if needed). Set `CORS_ORIGINS` to `*` until the UI URL exists, then set it to your **Render** frontend URL only.
-3. **Railway** — **Settings → Networking → Generate Domain** (or add a custom domain). Copy the public API URL (e.g. `https://your-api.up.railway.app`).
-4. **Render** — **New Web Service** → same GitHub repo → **Root Directory** `frontend` → **Node** → Build: `npm install && npm run build` → Start: `npm run start` → add **`NEXT_PUBLIC_API_URL`** = your Railway API URL (no trailing slash).
-5. After Render is **Live**, copy the frontend URL → paste into Railway **`CORS_ORIGINS`** → redeploy backend.
+# Web
+docker build -t shopwave-web -f frontend/Dockerfile ./frontend
+```
+
+### Railway / Render
+
+Create two services from the same repo:
+
+| Service | Root Directory | Start Command |
+|---------|---------------|---------------|
+| API | `backend` | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+| Web | `frontend` | Per platform docs |
+
+Set `NEXT_PUBLIC_API_URL` on the web service to the API's public URL.
+
+**Detailed split-host deployment** (e.g., Railway API + Render frontend):
+
+1. **Railway**: Add Redis template + GitHub repo with root `backend`
+2. **Railway**: Set env vars (`GROQ_API_KEY`, `DATABASE_URL`, `REDIS_URL`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`, `CORS_ORIGINS`)
+3. **Railway**: Generate domain, copy public API URL
+4. **Render**: New Web Service, root `frontend`, set `NEXT_PUBLIC_API_URL` to Railway URL
+5. Copy Render frontend URL back to Railway `CORS_ORIGINS`, redeploy
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| API | FastAPI + Uvicorn |
+| Orchestration | LangGraph + LangChain |
+| LLM Providers | Groq (free), OpenAI, Anthropic, Google, Ollama |
+| Background Workers | Celery + Redis broker |
+| Cache | Redis (aioredis) with multi-tier TTL |
+| Database | Supabase Postgres (asyncpg pool) |
+| Validation | Pydantic v2 (input + tool output + LLM output) |
+| Auth | API Key + SlowAPI rate limiting |
+| Frontend | Next.js 16 + React 19 + Tailwind 4 + Framer Motion |
+| Testing | pytest + pytest-asyncio (51 tests) |
+| Containers | Docker + Docker Compose |
+
+---
+
+## Project Structure
+
+```
+ksolves/
+|-- backend/
+|   |-- app/
+|   |   |-- api/routes/        # FastAPI route handlers
+|   |   |-- core/              # Config, LLM, cache, security, rate limiting
+|   |   |-- db/                # Postgres layer + seed data
+|   |   |-- graph/             # LangGraph: nodes, state, calibration
+|   |   |-- models/            # Pydantic schemas (input, output, audit)
+|   |   |-- services/          # Processor, audit, cost tracker, validator
+|   |   |-- tasks/             # Celery task definitions
+|   |   |-- tools/             # LangChain tools + validation + transparency
+|   |   +-- main.py            # FastAPI app factory
+|   |-- tests/                 # 51 tests
+|   |-- scripts/               # Maintenance scripts
+|   |-- Dockerfile
+|   |-- requirements.txt
+|   +-- .env.example
+|-- frontend/
+|   |-- app/                   # Next.js App Router pages
+|   |-- components/            # UI (glass panels, neon buttons, timelines)
+|   |-- lib/                   # API client, types, polling
+|   |-- Dockerfile
+|   +-- package.json
+|-- sample_data/               # Reference data files
+|-- docker-compose.yml         # Redis + optional full stack
+|-- ARCHITECTURE.md            # Full architecture deep-dive
++-- README.md                  # This file
+```
+
+---
 
 ## Testing
 
